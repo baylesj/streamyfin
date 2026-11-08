@@ -10,6 +10,7 @@ import {
 } from "react";
 import { Platform } from "react-native";
 import { useHaptic } from "@/hooks/useHaptic";
+import { BackgroundDownloader } from "@/modules";
 import { useSettings } from "@/utils/atoms/settings";
 import {
   getAllDownloadedItems,
@@ -23,6 +24,7 @@ import { useDownloadOperations } from "./Downloads/hooks/useDownloadOperations";
 import { useDownloadReconciliation } from "./Downloads/hooks/useDownloadReconciliation";
 import { setDownloadLiveActivityEnabled } from "./Downloads/liveActivity";
 import type { JobStatus } from "./Downloads/types";
+import { clampConcurrentDownloads } from "./Downloads/utils";
 import { apiAtom } from "./JellyfinProvider";
 
 export const processesAtom = atom<JobStatus[]>([]);
@@ -45,6 +47,15 @@ function useDownloadProvider() {
   useEffect(() => {
     setDownloadLiveActivityEnabled(liveActivityEnabled);
   }, [liveActivityEnabled]);
+
+  // Pushed across for the same reason: native advances its queue from URLSession and OkHttp
+  // callbacks, where it cannot ask JS how many downloads may run.
+  const maxConcurrentDownloads = clampConcurrentDownloads(
+    settings?.maxConcurrentDownloads,
+  );
+  useEffect(() => {
+    BackgroundDownloader.setMaxConcurrentDownloads(maxConcurrentDownloads);
+  }, [maxConcurrentDownloads]);
 
   // Reactive downloaded items that updates when refreshKey changes
   const downloadedItems = useMemo(() => {

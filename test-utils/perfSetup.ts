@@ -70,6 +70,7 @@ jest.mock("@/modules", () => {
       addCompleteListener: () => ({ remove: () => {} }),
       addErrorListener: () => ({ remove: () => {} }),
       setLiveActivityEnabled: () => {},
+      setMaxConcurrentDownloads: () => {},
     },
   };
 });

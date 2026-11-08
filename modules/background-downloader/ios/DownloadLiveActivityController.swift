@@ -22,6 +22,10 @@
   /// requesting a fresh one per download would leave every episode after the first without an
   /// activity whenever the app is backgrounded.
   ///
+  /// With several downloads running at once the activity follows one of them. A download that
+  /// starts while it shows a running one is not shown; when the shown one ends, the module rebinds
+  /// the activity to a download still running.
+  ///
   /// It cannot beat suspension: while iOS has the process suspended no code runs at all and the
   /// transfer continues out-of-process in `nsurlsessiond`. That is why every update carries a
   /// `staleDate`, so the system visibly de-emphasizes numbers that have gone old.
@@ -57,6 +61,13 @@
       var lastSampleAt: Date
       var lastBytes: Int64
       var emaSpeed: Double
+      /// Set when bound to a download that may already be part way through. Its first progress
+      /// tick only records the byte count, so the bytes from before the bind are not read as
+      /// one second's speed.
+      var needsSpeedSeed: Bool
+      /// Its download ended and the activity was kept for the queue or the downloads still
+      /// running. The next start() rebinds it; until then it shows the result.
+      var isFinished: Bool
     }
 
     private let queue = DispatchQueue(
@@ -97,6 +108,9 @@
       queue.async {
         guard self.isEnabled else { return }
         guard self.tracker?.taskId != taskId else { return }
+        // Keep showing a running download instead of switching to each new one; several start at
+        // once when the concurrent limit is above one.
+        if let tracker = self.tracker, !tracker.isFinished { return }
 
         let now = Date()
         let state = self.contentState(
@@ -122,7 +136,9 @@
             lastPushedAt: now,
             lastSampleAt: now,
             lastBytes: 0,
-            emaSpeed: 0
+            emaSpeed: 0,
+            needsSpeedSeed: true,
+            isFinished: false
           )
           self.push(
             activityId: activityId,
@@ -154,7 +170,9 @@
             lastPushedAt: now,
             lastSampleAt: now,
             lastBytes: 0,
-            emaSpeed: 0
+            emaSpeed: 0,
+            needsSpeedSeed: true,
+            isFinished: false
           )
           liveActivityLog.notice("Requested new activity for task \(taskId)")
         } catch {
@@ -170,7 +188,9 @@
 
     func update(taskId: Int, bytesWritten: Int64, totalBytes: Int64) {
       queue.async {
-        guard self.isEnabled, var tracker = self.tracker, tracker.taskId == taskId else { return }
+        guard self.isEnabled, var tracker = self.tracker, tracker.taskId == taskId,
+          !tracker.isFinished
+        else { return }
 
         let now = Date()
         let sampleInterval = now.timeIntervalSince(tracker.lastSampleAt)
@@ -178,7 +198,11 @@
         // Speed is computed here rather than reusing the JS calculator in
         // providers/Downloads/hooks/useDownloadSpeedCalculator.ts, because that one only runs while
         // the JS runtime is alive — exactly when we do not need it.
-        if sampleInterval >= Self.minSpeedSampleInterval, bytesWritten >= tracker.lastBytes {
+        if tracker.needsSpeedSeed {
+          tracker.needsSpeedSeed = false
+          tracker.lastBytes = bytesWritten
+          tracker.lastSampleAt = now
+        } else if sampleInterval >= Self.minSpeedSampleInterval, bytesWritten >= tracker.lastBytes {
           let instantaneous = Double(bytesWritten - tracker.lastBytes) / sampleInterval
           tracker.emaSpeed =
             tracker.emaSpeed == 0
@@ -251,9 +275,9 @@
       }
     }
 
-    func finish(taskId: Int, state finalState: DownloadActivityState) {
+    func finish(taskId: Int, state finalState: DownloadActivityState, othersRunning: Int) {
       queue.async {
-        guard let tracker = self.tracker, tracker.taskId == taskId else { return }
+        guard var tracker = self.tracker, tracker.taskId == taskId else { return }
 
         let content = self.contentState(
           for: tracker.metadata,
@@ -264,13 +288,15 @@
           state: finalState
         )
 
-        if self.queuedCount > 0 {
-          // More downloads are queued and the app may be backgrounded, where a replacement
-          // activity could not be requested. Keep this one alive showing the result; the next
-          // download's start() rebinds it moments later.
+        if self.queuedCount > 0 || othersRunning > 0 {
+          // More downloads are queued or still running, and the app may be backgrounded, where a
+          // replacement activity could not be requested. Keep this one alive showing the result;
+          // the module's start() for the next download rebinds it moments later.
           liveActivityLog.notice(
-            "Task \(taskId) finished (\(finalState.rawValue, privacy: .public)); keeping activity for \(self.queuedCount) queued download(s)"
+            "Task \(taskId) finished (\(finalState.rawValue, privacy: .public)); keeping activity for \(self.queuedCount) queued, \(othersRunning) running"
           )
+          tracker.isFinished = true
+          self.tracker = tracker
           self.push(
             activityId: tracker.activityId,
             state: content,
@@ -291,11 +317,16 @@
       }
     }
 
-    func cancel(taskId: Int) {
+    func cancel(taskId: Int, othersRunning: Int) {
       queue.async {
-        guard let tracker = self.tracker, tracker.taskId == taskId else { return }
-        // With downloads still queued the activity is kept for rebinding, same as finish().
-        guard self.queuedCount == 0 else { return }
+        guard var tracker = self.tracker, tracker.taskId == taskId else { return }
+        // With downloads still queued or running the activity is kept for rebinding, same as
+        // finish().
+        guard self.queuedCount == 0, othersRunning == 0 else {
+          tracker.isFinished = true
+          self.tracker = tracker
+          return
+        }
         self.tracker = nil
         self.end(activityId: tracker.activityId, state: nil, dismissalPolicy: .immediate)
       }
@@ -341,7 +372,9 @@
               // Seeded from the activity's last rendered state so the first speed sample measures
               // the delta since relaunch, not the whole download so far.
               lastBytes: activity.content.state.bytesDownloaded,
-              emaSpeed: 0
+              emaSpeed: 0,
+              needsSpeedSeed: false,
+              isFinished: false
             )
             liveActivityLog.notice("Adopted surviving activity for restored task")
           } else if self.tracker?.activityId != activity.id {

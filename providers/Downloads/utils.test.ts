@@ -3,6 +3,12 @@ import type {
   MediaStream,
 } from "@jellyfin/sdk/lib/generated-client/models";
 import {
+  DEFAULT_MAX_CONCURRENT_DOWNLOADS,
+  MAX_CONCURRENT_DOWNLOADS,
+  MIN_CONCURRENT_DOWNLOADS,
+} from "@/constants/Downloads";
+import {
+  clampConcurrentDownloads,
   generateFilename,
   liveActivityPosterFileName,
   rebaseOntoAppDirectory,
@@ -293,4 +299,31 @@ describe("a stored location in a deeper directory of the app's container", () =>
       `${now}/Documents/show_s01e01.mp4`,
     );
   });
+});
+
+describe("clampConcurrentDownloads", () => {
+  it("passes a limit inside the range through", () => {
+    expect(clampConcurrentDownloads(2)).toBe(2);
+  });
+
+  it("holds the limit to the allowed range", () => {
+    expect(clampConcurrentDownloads(0)).toBe(MIN_CONCURRENT_DOWNLOADS);
+    expect(clampConcurrentDownloads(-3)).toBe(MIN_CONCURRENT_DOWNLOADS);
+    expect(clampConcurrentDownloads(99)).toBe(MAX_CONCURRENT_DOWNLOADS);
+  });
+
+  it("rounds a fractional limit down", () => {
+    expect(clampConcurrentDownloads(2.7)).toBe(2);
+  });
+
+  // Settings stored before this one existed have no value; native must never see NaN or 0,
+  // which would stall the queue.
+  it.each([undefined, null, Number.NaN, Number.POSITIVE_INFINITY, "3"])(
+    "falls back to the default for %p",
+    (value) => {
+      expect(clampConcurrentDownloads(value)).toBe(
+        DEFAULT_MAX_CONCURRENT_DOWNLOADS,
+      );
+    },
+  );
 });

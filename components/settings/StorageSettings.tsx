@@ -3,15 +3,23 @@ import { useTranslation } from "react-i18next";
 import { Platform, View } from "react-native";
 import { toast } from "sonner-native";
 import { Text } from "@/components/common/Text";
+import { Stepper } from "@/components/inputs/Stepper";
 import { Colors } from "@/constants/Colors";
+import {
+  MAX_CONCURRENT_DOWNLOADS,
+  MIN_CONCURRENT_DOWNLOADS,
+} from "@/constants/Downloads";
 import { useConfirmDelete } from "@/hooks/useConfirmDelete";
 import { useHaptic } from "@/hooks/useHaptic";
 import { useDownload } from "@/providers/DownloadProvider";
+import { clampConcurrentDownloads } from "@/providers/Downloads/utils";
+import { useSettings } from "@/utils/atoms/settings";
 import { ListGroup } from "../list/ListGroup";
 import { ListItem } from "../list/ListItem";
 
 export const StorageSettings = () => {
   const { deleteAllFiles, appSizeUsage } = useDownload();
+  const { settings, updateSettings } = useSettings();
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const confirmDelete = useConfirmDelete();
@@ -120,6 +128,20 @@ export const StorageSettings = () => {
       </View>
       {!Platform.isTV && (
         <ListGroup className='mt-4'>
+          <ListItem
+            title={t("home.settings.storage.concurrent_downloads")}
+            subtitle={t("home.settings.storage.concurrent_downloads_hint")}
+          >
+            <Stepper
+              value={clampConcurrentDownloads(settings?.maxConcurrentDownloads)}
+              step={1}
+              min={MIN_CONCURRENT_DOWNLOADS}
+              max={MAX_CONCURRENT_DOWNLOADS}
+              onUpdate={(maxConcurrentDownloads) =>
+                updateSettings({ maxConcurrentDownloads })
+              }
+            />
+          </ListItem>
           <ListItem
             textColor='red'
             onPress={onDeleteClicked}

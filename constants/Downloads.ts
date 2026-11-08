@@ -15,3 +15,12 @@ export const DOWNLOAD_PART_FILE_SUFFIX = ".part";
 // A failed download's toast says why and what to do in two or three lines, more than the four
 // seconds the Toaster gives a toast leave time to read.
 export const DOWNLOAD_FAILURE_TOAST_DURATION_MS = 8000;
+
+// How many downloads the native queue runs at once. One by default: a transcoded download makes
+// the server transcode the whole file, and several at once can saturate a small server. Users on
+// a server with headroom raise it in the storage settings.
+export const DEFAULT_MAX_CONCURRENT_DOWNLOADS = 1;
+export const MIN_CONCURRENT_DOWNLOADS = 1;
+// Kept well under the six connections per host an iOS background URLSession opens, so a burst of
+// downloads never starves the rest of the app's requests to the same server.
+export const MAX_CONCURRENT_DOWNLOADS = 3;
