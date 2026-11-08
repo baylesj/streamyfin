@@ -522,6 +522,8 @@
         "app_usage": "App {{usedSpace}}%",
         "device_usage": "Device {{availableSpace}}%",
         "size_used": "{{used}} of {{total}} used",
+        "concurrent_downloads": "Simultaneous downloads",
+        "concurrent_downloads_hint": "How many downloads run at once. More than one finishes a queue sooner but adds load on your server, especially for transcoded downloads.",
         "delete_all_downloaded_files": "Delete all downloaded files",
         "delete_all_downloaded_files_confirm": "Delete all downloaded files?",
         "delete_all_downloaded_files_confirm_desc": "Are you sure you want to delete all downloaded files? This action cannot be undone.",

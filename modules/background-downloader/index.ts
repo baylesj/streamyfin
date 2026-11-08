@@ -33,6 +33,12 @@ export interface BackgroundDownloader {
   cancelAllDownloads(): void;
   getActiveDownloads(): Promise<ActiveDownload[]>;
 
+  /**
+   * How many queued downloads native runs at once. Raising it starts queued downloads right
+   * away; lowering it lets the running ones finish and starts no more until under the limit.
+   */
+  setMaxConcurrentDownloads(limit: number): void;
+
   /** iOS only; no-op elsewhere. Ends any live activity when turned off. */
   setLiveActivityEnabled(enabled: boolean): void;
 
@@ -87,6 +93,10 @@ const BackgroundDownloader: BackgroundDownloader = {
       metadata,
       headers,
     );
+  },
+
+  setMaxConcurrentDownloads(limit: number): void {
+    BackgroundDownloaderModule.setMaxConcurrentDownloads?.(limit);
   },
 
   setLiveActivityEnabled(enabled: boolean): void {

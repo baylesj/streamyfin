@@ -43,6 +43,11 @@ class BackgroundDownloaderModule : Module() {
   private val downloadTasks = mutableMapOf<Int, DownloadTaskInfo>()
   private val downloadQueue = mutableListOf<QueuedDownload>()
   private var taskIdCounter = 1
+  /// How many queued downloads run at once; JS pushes the user's setting on start. Not persisted:
+  /// unlike iOS, nothing advances this queue while the app's process is gone.
+  private var maxConcurrentDownloads = 1
+  /// Latest (bytes written, total bytes) of each running download, for the shared notification.
+  private val transferProgress = mutableMapOf<Int, Pair<Long, Long>>()
 
   @Volatile
   private var downloadService: DownloadService? = null
@@ -114,8 +119,6 @@ class BackgroundDownloaderModule : Module() {
         Log.d(TAG, "Enqueuing download: url=${redactCredentials(urlString)}")
 
         val taskId = synchronized(stateLock) {
-          // Add to queue
-          val wasEmpty = downloadQueue.isEmpty()
           downloadQueue.add(
             QueuedDownload(
               url = urlString,
@@ -126,13 +129,9 @@ class BackgroundDownloaderModule : Module() {
           )
           Log.d(TAG, "Queue size: ${downloadQueue.size}")
 
-          // If queue was empty and no active downloads, start processing immediately
-          if (wasEmpty && downloadTasks.isEmpty()) {
-            processNextInQueueLocked()
-          } else {
-            // Return placeholder taskId for queued items
-            -1
-          }
+          // Starts it now when a slot is free. Otherwise -1: it waits in the queue for a
+          // running download to end.
+          processNextInQueueLocked()
         }
         promise.resolve(taskId)
       } catch (e: Exception) {
@@ -146,9 +145,23 @@ class BackgroundDownloaderModule : Module() {
 
       synchronized(stateLock) {
         downloadTasks.remove(taskId)
+        transferProgress.remove(taskId)
         // Process next item in queue after cancellation
         processNextInQueueLocked()
         syncServiceLocked()
+      }
+    }
+
+    Function("setMaxConcurrentDownloads") { limit: Int ->
+      synchronized(stateLock) {
+        val clamped = limit.coerceAtLeast(1)
+        if (clamped != maxConcurrentDownloads) {
+          maxConcurrentDownloads = clamped
+          Log.d(TAG, "Concurrent download limit set to $clamped")
+          // Raising the limit starts queued downloads now rather than at the next completion.
+          // Lowering it stops nothing: running downloads finish and the queue waits below it.
+          processNextInQueueLocked()
+        }
       }
     }
 
@@ -168,6 +181,7 @@ class BackgroundDownloaderModule : Module() {
       synchronized(stateLock) {
         downloadTasks.clear()
         downloadQueue.clear()
+        transferProgress.clear()
       }
       stopDownloadService()
     }
@@ -259,30 +273,32 @@ class BackgroundDownloaderModule : Module() {
     return taskId
   }
 
+  /**
+   * Starts queued downloads until `maxConcurrentDownloads` are running or the queue is empty.
+   *
+   * Returns the task id of the last download started when that emptied the queue, which makes it
+   * the most recently enqueued one (what `enqueueDownload` reports back to JS), and -1 when that
+   * one is still waiting or failed to start.
+   */
   private fun processNextInQueueLocked(): Int {
-    // Check if queue has items
-    if (downloadQueue.isEmpty()) {
-      Log.d(TAG, "Queue is empty")
-      return -1
+    var lastStarted = -1
+    while (
+      downloadQueue.isNotEmpty() &&
+      DownloadConcurrency.hasFreeSlot(downloadTasks.size, maxConcurrentDownloads)
+    ) {
+      val next = downloadQueue.removeAt(0)
+      Log.d(TAG, "Processing next in queue: ${redactCredentials(next.url)}")
+      lastStarted = try {
+        startDownloadLocked(next.url, next.destinationPath, next.itemId, next.headers)
+      } catch (e: Exception) {
+        Log.e(TAG, "Error processing queue item: ${e.message}", e)
+        -1
+      }
     }
-
-    // Check if there are active downloads (one at a time)
-    if (downloadTasks.isNotEmpty()) {
-      Log.d(TAG, "Active downloads in progress (${downloadTasks.size}), waiting...")
-      return -1
+    if (downloadQueue.isNotEmpty()) {
+      Log.d(TAG, "${downloadTasks.size} running, ${downloadQueue.size} waiting")
     }
-
-    // Get next item from queue
-    val next = downloadQueue.removeAt(0)
-    Log.d(TAG, "Processing next in queue: ${redactCredentials(next.url)}")
-
-    return try {
-      startDownloadLocked(next.url, next.destinationPath, next.itemId, next.headers)
-    } catch (e: Exception) {
-      Log.e(TAG, "Error processing queue item: ${e.message}", e)
-      // Try to process next item
-      processNextInQueueLocked()
-    }
+    return if (downloadQueue.isEmpty()) lastStarted else -1
   }
 
   // Called from OkHttp dispatcher threads.
@@ -294,12 +310,16 @@ class BackgroundDownloaderModule : Module() {
       0.0
     }
 
-    val taskInfo = synchronized(stateLock) { downloadTasks[taskId] }
+    val (taskInfo, running, percent) = synchronized(stateLock) {
+      val info = downloadTasks[taskId]
+      if (info != null) transferProgress[taskId] = bytesWritten to totalBytes
+      Triple(info, downloadTasks.size, DownloadConcurrency.combinedPercent(transferProgress.values))
+    }
 
-    // Update notification
+    // One notification for every running download, so its bar shows them together.
     if (taskInfo != null) {
-      val progressPercent = (progress * 100).toInt()
-      downloadService?.updateProgress("Downloading video", progressPercent)
+      val title = if (running > 1) "Downloading $running videos" else "Downloading video"
+      downloadService?.updateProgress(title, percent)
     }
 
     val payload = mutableMapOf<String, Any>(
@@ -337,6 +357,7 @@ class BackgroundDownloaderModule : Module() {
 
     synchronized(stateLock) {
       downloadTasks.remove(taskId)
+      transferProgress.remove(taskId)
       // Process next item in queue
       processNextInQueueLocked()
       syncServiceLocked()
@@ -357,6 +378,7 @@ class BackgroundDownloaderModule : Module() {
 
     synchronized(stateLock) {
       downloadTasks.remove(taskId)
+      transferProgress.remove(taskId)
       // Process next item in queue even on error
       processNextInQueueLocked()
       syncServiceLocked()

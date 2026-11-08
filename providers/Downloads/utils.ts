@@ -4,8 +4,11 @@ import type {
 } from "@jellyfin/sdk/lib/generated-client/models";
 import { escapeRegExp } from "lodash";
 import {
+  DEFAULT_MAX_CONCURRENT_DOWNLOADS,
   DOWNLOAD_SUBTITLE_INFIX,
   DOWNLOAD_TRICKPLAY_DIR_SUFFIX,
+  MAX_CONCURRENT_DOWNLOADS,
+  MIN_CONCURRENT_DOWNLOADS,
 } from "@/constants/Downloads";
 
 /**
@@ -190,4 +193,20 @@ export function filePathToUri(path: string): string {
     return path;
   }
   return `file://${path}`;
+}
+
+/**
+ * The concurrent download limit native is given: a whole number inside the allowed range. The
+ * setting is stored as it was written, so a value from an older build, a plugin, or a hand-edited
+ * store falls back to the default rather than reaching native as 0 or NaN, which would stall the
+ * queue.
+ */
+export function clampConcurrentDownloads(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_MAX_CONCURRENT_DOWNLOADS;
+  }
+  return Math.min(
+    MAX_CONCURRENT_DOWNLOADS,
+    Math.max(MIN_CONCURRENT_DOWNLOADS, Math.floor(value)),
+  );
 }

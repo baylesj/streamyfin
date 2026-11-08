@@ -140,6 +140,15 @@ public class BackgroundDownloaderModule: Module {
   private var downloadTasks: [Int: DownloadTaskInfo] = [:]
   private var downloadQueue: [QueuedDownloadInfo] = []
   private var lastProgressTime: [Int: Date] = [:]
+  /// How many queued downloads run at once. Mirrors the JS `maxConcurrentDownloads` setting and is
+  /// persisted, because iOS relaunches the app to advance the queue before JS has pushed it.
+  private var maxConcurrentDownloads = 1
+  private static let maxConcurrentDownloadsKey =
+    "com.fredrikburmester.streamyfin.backgrounddownloader.maxConcurrentDownloads"
+  /// Latest bytes of every download in the current batch. The continued-processing task has one
+  /// progress bar, so with several downloads running it shows their sum instead of jumping between
+  /// whichever one reported last. Cleared once the batch drains.
+  private var transferProgress: [Int: (written: Int64, total: Int64)] = [:]
   /// Mirrors the JS `showDownloadLiveActivity` setting. Gates both the module's own activity
   /// (also gated inside the controller) and the continued-processing keeper, whose system UI is
   /// equally lock-screen download UI the user asked to turn off.
@@ -171,6 +180,8 @@ public class BackgroundDownloaderModule: Module {
         // download that completed while we were dead can still be moved into place.
         self.downloadTasks = self.taskStore.load()
         self.downloadQueue = self.taskStore.loadQueue()
+        let storedLimit = UserDefaults.standard.integer(forKey: Self.maxConcurrentDownloadsKey)
+        self.maxConcurrentDownloads = max(1, storedLimit)
         backgroundDownloaderLog.notice(
           "Module created: restored \(self.downloadTasks.count) task(s), \(self.downloadQueue.count) queued"
         )
@@ -181,6 +192,19 @@ public class BackgroundDownloaderModule: Module {
         // in flight; if that task is actually gone (force-quit cancels transfers), the session
         // delivers its cancellation error shortly after reconnecting, and handleError advances
         // the queue from there.
+        self.processNextInQueueSafelyLocked()
+      }
+    }
+
+    Function("setMaxConcurrentDownloads") { (limit: Int) in
+      self.stateQueue.sync {
+        let clamped = max(1, limit)
+        guard clamped != self.maxConcurrentDownloads else { return }
+        self.maxConcurrentDownloads = clamped
+        UserDefaults.standard.set(clamped, forKey: Self.maxConcurrentDownloadsKey)
+        backgroundDownloaderLog.notice("Concurrent download limit set to \(clamped)")
+        // Raising the limit starts queued downloads now rather than at the next completion.
+        // Lowering it stops nothing: running downloads finish and the queue waits below the limit.
         self.processNextInQueueSafelyLocked()
       }
     }
@@ -236,7 +260,6 @@ public class BackgroundDownloaderModule: Module {
       (urlString: String, destinationPath: String?, metadata: DownloadMetadataRecord?,
         headers: [String: String]?) -> Int in
       try self.stateQueue.sync { () throws -> Int in
-        let wasEmpty = self.downloadQueue.isEmpty
         self.downloadQueue.append(
           QueuedDownloadInfo(
             url: urlString,
@@ -247,19 +270,17 @@ public class BackgroundDownloaderModule: Module {
         )
         self.queueDidChangeLocked()
 
-        // If queue was empty and no active downloads, start processing immediately
-        if wasEmpty {
-          return try self.processNextInQueueLocked()
-        }
-
-        // Return placeholder taskId for queued items
-        return -1
+        // Starts it now when a slot is free. Otherwise -1: it waits in the queue for a running
+        // download to end.
+        return try self.processNextInQueueLocked()
       }
     }
 
     Function("cancelDownload") { (taskId: Int) in
-      self.cancelLiveActivity(taskId: taskId)
-      let session = self.stateQueue.sync { self.session }
+      let session = self.stateQueue.sync { () -> URLSession? in
+        self.cancelLiveActivityLocked(taskId: taskId)
+        return self.session
+      }
       session?.getAllTasks { tasks in
         for task in tasks where task.taskIdentifier == taskId {
           task.cancel()
@@ -296,6 +317,7 @@ public class BackgroundDownloaderModule: Module {
         }
         self.stateQueue.async {
           self.downloadTasks.removeAll()
+          self.transferProgress.removeAll()
           self.persistTasksLocked()
           self.finishContinuedProcessingIfIdleLocked()
         }
@@ -514,7 +536,7 @@ public class BackgroundDownloaderModule: Module {
   ) {
     guard let taskInfo = downloadTasks[taskId] else {
       backgroundDownloaderLog.error("Completion for task \(taskId) but no task info was found")
-      finishLiveActivity(taskId: taskId, state: .failed)
+      finishLiveActivityLocked(taskId: taskId, state: .failed)
       self.sendEvent("onDownloadError", [
         "taskId": taskId,
         "error": "Download task info not found"
@@ -537,7 +559,7 @@ public class BackgroundDownloaderModule: Module {
       backgroundDownloaderLog.error(
         "Task \(taskId) finished with HTTP \(httpResponse.statusCode); treating as failure"
       )
-      finishLiveActivity(taskId: taskId, state: .failed)
+      finishLiveActivityLocked(taskId: taskId, state: .failed)
 
       var payload: [String: Any] = [
         "taskId": taskId,
@@ -590,7 +612,7 @@ public class BackgroundDownloaderModule: Module {
 
       backgroundDownloaderLog.notice("Task \(taskId) completed; file moved into place")
 
-      finishLiveActivity(taskId: taskId, state: .completed)
+      finishLiveActivityLocked(taskId: taskId, state: .completed)
 
       var payload: [String: Any] = [
         "taskId": taskId,
@@ -611,7 +633,7 @@ public class BackgroundDownloaderModule: Module {
       backgroundDownloaderLog.error(
         "Task \(taskId) file operation failed: \(error.localizedDescription, privacy: .public)"
       )
-      finishLiveActivity(taskId: taskId, state: .failed)
+      finishLiveActivityLocked(taskId: taskId, state: .failed)
 
       var payload: [String: Any] = [
         "taskId": taskId,
@@ -638,9 +660,9 @@ public class BackgroundDownloaderModule: Module {
       backgroundDownloaderLog.notice("Task \(taskId) cancelled")
       // JS drives cancellation, so it has usually dismissed the activity already; this covers
       // cancels that originate anywhere else.
-      cancelLiveActivity(taskId: taskId)
+      cancelLiveActivityLocked(taskId: taskId)
     } else {
-      finishLiveActivity(taskId: taskId, state: .failed)
+      finishLiveActivityLocked(taskId: taskId, state: .failed)
 
       var payload: [String: Any] = [
         "taskId": taskId,
@@ -654,6 +676,8 @@ public class BackgroundDownloaderModule: Module {
 
     downloadTasks.removeValue(forKey: taskId)
     lastProgressTime.removeValue(forKey: taskId)
+    // It will never finish, so it leaves the batch's progress total too.
+    transferProgress.removeValue(forKey: taskId)
     persistTasksLocked()
 
     // Process next item in queue (whether cancelled or errored)
@@ -663,30 +687,31 @@ public class BackgroundDownloaderModule: Module {
   /// Nothing in here is actually asynchronous — the previous `async` shape existed only so the
   /// completion handlers could spawn it inside detached `Task`s, which added a fourth unsynchronized
   /// execution context. Now it is a plain function that runs where the state lives.
+  /// Starts queued downloads until `maxConcurrentDownloads` are running or the queue is empty.
+  ///
+  /// Returns the task id of the last download started when that emptied the queue, which makes it
+  /// the most recently enqueued one (what `enqueueDownload` reports back to JS), and -1 when that
+  /// one is still waiting or was skipped.
   private func processNextInQueueLocked() throws -> Int {
-    guard !downloadQueue.isEmpty else {
-      return -1
+    var lastStarted = -1
+    while !downloadQueue.isEmpty, downloadTasks.count < maxConcurrentDownloads {
+      let next = downloadQueue.removeFirst()
+      queueDidChangeLocked()
+
+      guard URL(string: next.url) != nil else {
+        backgroundDownloaderLog.error("Invalid URL in queue; skipping to next")
+        lastStarted = -1
+        continue
+      }
+
+      lastStarted = try beginDownloadLocked(
+        urlString: next.url,
+        destinationPath: next.destinationPath,
+        metadata: next.metadata,
+        headers: next.headers
+      )
     }
-
-    // One download at a time
-    guard downloadTasks.isEmpty else {
-      return -1
-    }
-
-    let next = downloadQueue.removeFirst()
-    queueDidChangeLocked()
-
-    guard URL(string: next.url) != nil else {
-      backgroundDownloaderLog.error("Invalid URL in queue; skipping to next")
-      return try processNextInQueueLocked()
-    }
-
-    return try beginDownloadLocked(
-      urlString: next.url,
-      destinationPath: next.destinationPath,
-      metadata: next.metadata,
-      headers: next.headers
-    )
+    return downloadQueue.isEmpty ? lastStarted : -1
   }
 
   private func processNextInQueueSafelyLocked() {
@@ -697,6 +722,9 @@ public class BackgroundDownloaderModule: Module {
         "Failed to start next queued download: \(error.localizedDescription, privacy: .public)"
       )
     }
+    // A download that ended may have been the one the Live Activity showed; hand the activity to
+    // one still running so it does not sit on a finished result while others progress.
+    rebindLiveActivityLocked()
     // Reached after every completion/error/cancel; ends the keeper when the session drained.
     finishContinuedProcessingIfIdleLocked()
   }
@@ -746,17 +774,44 @@ public class BackgroundDownloaderModule: Module {
     #endif
   }
 
-  private func finishLiveActivity(taskId: Int, state: DownloadActivityState) {
+  private func finishLiveActivityLocked(taskId: Int, state: DownloadActivityState) {
     #if os(iOS)
       guard #available(iOS 16.2, *) else { return }
-      DownloadLiveActivityController.shared.finish(taskId: taskId, state: state)
+      DownloadLiveActivityController.shared.finish(
+        taskId: taskId,
+        state: state,
+        othersRunning: otherRunningCountLocked(excluding: taskId)
+      )
     #endif
   }
 
-  private func cancelLiveActivity(taskId: Int) {
+  private func cancelLiveActivityLocked(taskId: Int) {
     #if os(iOS)
       guard #available(iOS 16.2, *) else { return }
-      DownloadLiveActivityController.shared.cancel(taskId: taskId)
+      DownloadLiveActivityController.shared.cancel(
+        taskId: taskId,
+        othersRunning: otherRunningCountLocked(excluding: taskId)
+      )
+    #endif
+  }
+
+  /// Running downloads other than `taskId`. Read before the ended task is removed, so the activity
+  /// controller knows whether to keep its one activity alive for the rest.
+  private func otherRunningCountLocked(excluding taskId: Int) -> Int {
+    downloadTasks.keys.filter { $0 != taskId }.count
+  }
+
+  /// Points the activity at the oldest running download. The controller ignores this while the
+  /// activity still shows a download that is running, so it only moves off a finished one.
+  private func rebindLiveActivityLocked() {
+    #if os(iOS)
+      guard #available(iOS 16.2, *) else { return }
+      guard
+        let oldest = downloadTasks
+          .compactMap({ entry in entry.value.metadata.map { (taskId: entry.key, metadata: $0) } })
+          .min(by: { $0.taskId < $1.taskId })
+      else { return }
+      DownloadLiveActivityController.shared.start(taskId: oldest.taskId, metadata: oldest.metadata)
     #endif
   }
 
@@ -797,9 +852,13 @@ public class BackgroundDownloaderModule: Module {
         totalBytes > 0
         ? totalBytes
         : downloadTasks[taskId]?.metadata?.estimatedTotalBytes ?? 0
+      transferProgress[taskId] = (bytesWritten, effectiveTotal)
+      // Finished downloads stay in the sum until the batch drains, so the completed count only
+      // ever grows: the system may end a task whose progress stops advancing.
+      let batch = transferProgress.values
       DownloadContinuedProcessingKeeper.shared.updateProgress(
-        completedBytes: bytesWritten,
-        totalBytes: effectiveTotal
+        completedBytes: batch.reduce(Int64(0)) { $0 + $1.written },
+        totalBytes: batch.reduce(Int64(0)) { $0 + $1.total }
       )
     #endif
   }
@@ -808,6 +867,7 @@ public class BackgroundDownloaderModule: Module {
     #if os(iOS) && compiler(>=6.2)
       guard #available(iOS 26.0, *) else { return }
       guard downloadTasks.isEmpty, downloadQueue.isEmpty else { return }
+      transferProgress.removeAll()
       DownloadContinuedProcessingKeeper.shared.finish()
     #endif
   }

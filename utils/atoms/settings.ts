@@ -14,6 +14,7 @@ import { atom, useAtom, useAtomValue, useStore } from "jotai";
 import { useCallback, useEffect } from "react";
 import { Platform } from "react-native";
 import { BITRATES, type Bitrate } from "@/components/BitrateSelector";
+import { DEFAULT_MAX_CONCURRENT_DOWNLOADS } from "@/constants/Downloads";
 import {
   DEFAULT_MUSIC_NORMALIZATION_MODE,
   type MusicNormalizationMode,
@@ -422,6 +423,8 @@ export type Settings = {
   downloadQuality?: DownloadOption;
   /** iOS only: show a Lock Screen / Dynamic Island Live Activity while a download runs. */
   showDownloadLiveActivity: boolean;
+  /** How many downloads run at once. Clamped by clampConcurrentDownloads before native sees it. */
+  maxConcurrentDownloads: number;
   defaultBitrate?: Bitrate;
   libraryOptions: LibraryOptions;
   defaultAudioLanguage: CultureDto | null;
@@ -624,6 +627,7 @@ export const defaultValues: Settings = {
   streamyStatsPromotedWatchlists: false,
   downloadQuality: DownloadOptions[0],
   showDownloadLiveActivity: true,
+  maxConcurrentDownloads: DEFAULT_MAX_CONCURRENT_DOWNLOADS,
   defaultBitrate: BITRATES[0],
   libraryOptions: {
     display: "list",

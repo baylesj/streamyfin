@@ -80,6 +80,8 @@ export interface BackgroundDownloaderModuleType {
   cancelQueuedDownload(url: string): void;
   cancelAllDownloads(): void;
   getActiveDownloads(): Promise<ActiveDownload[]>;
+  /** How many queued downloads run at once. Optional so an older native build still loads. */
+  setMaxConcurrentDownloads?(limit: number): void;
   /** iOS only — absent from the Android module. */
   setLiveActivityEnabled?(enabled: boolean): void;
   /** iOS only — absent from the Android module. */

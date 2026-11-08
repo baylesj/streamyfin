@@ -245,7 +245,7 @@ export function useDownloadOperations({
           activityMetadata,
         });
 
-        // Start the download using enqueueDownload for sequential processing
+        // Native queues it and starts it once fewer than the concurrent limit are running
         const taskId = await BackgroundDownloader.enqueueDownload(
           downloadUrl,
           destinationPath,
